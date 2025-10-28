@@ -1,21 +1,21 @@
 import os
 import pandas as pd
-from io import BytesIO
+from .utils import file_lock, get_temp_path
 import ibm_boto3
 from ibm_botocore.client import Config
 from typing import Optional
-from .utils import file_lock, get_temp_path
 
+# Local path where trabajamos
 EXCEL_LOCAL_PATH = "data/employees.xlsx"
-# Nombre del objeto en COS (por ejemplo 'employees.xlsx')
 EXCEL_OBJECT_NAME = os.getenv("EXCEL_OBJECT_NAME", "employees.xlsx")
+COS_BUCKET = os.getenv("COS_BUCKET")
 
 def get_cos_client():
     endpoint = os.getenv("COS_ENDPOINT")
     api_key = os.getenv("COS_API_KEY")
-    resource_instance_id = os.getenv("COS_RESOURCE_INSTANCE_ID", "")
-    if not endpoint or not api_key:
-        raise RuntimeError("Faltan variables de entorno COS (COS_ENDPOINT/COS_API_KEY).")
+    resource_instance_id = os.getenv("COS_RESOURCE_INSTANCE_ID", None)
+    if not endpoint or not api_key or not COS_BUCKET:
+        raise RuntimeError("Variables COS no configuradas: COS_ENDPOINT/COS_API_KEY/COS_BUCKET necesarias.")
     return ibm_boto3.client(
         "s3",
         ibm_api_key_id=api_key,
@@ -24,92 +24,75 @@ def get_cos_client():
         endpoint_url=endpoint
     )
 
-def download_from_cos():
-    """
-    Descarga el objeto EXCEL_OBJECT_NAME desde COS al path data/employees.xlsx
-    Si no existe en COS, deja el archivo local si está.
-    """
+def download_from_cos() -> bool:
+    """Descarga EXCEL_OBJECT_NAME desde COS a EXCEL_LOCAL_PATH. Retorna True si la descarga fue exitosa."""
     try:
         cos = get_cos_client()
-        local_dir = os.path.dirname(EXCEL_LOCAL_PATH)
-        os.makedirs(local_dir, exist_ok=True)
-        # Obtenemos el archivo en memoria y lo guardamos localmente
-        tmp_path = get_temp_path(EXCEL_OBJECT_NAME)
-        with open(tmp_path, "wb") as f:
-            cos.download_fileobj(os.getenv("COS_BUCKET"), EXCEL_OBJECT_NAME, f)
-        # Mover a destino
-        os.replace(tmp_path, EXCEL_LOCAL_PATH)
+        os.makedirs(os.path.dirname(EXCEL_LOCAL_PATH), exist_ok=True)
+        tmp = get_temp_path(EXCEL_OBJECT_NAME)
+        with open(tmp, "wb") as f:
+            cos.download_fileobj(COS_BUCKET, EXCEL_OBJECT_NAME, f)
+        os.replace(tmp, EXCEL_LOCAL_PATH)
+        print("Descargado desde COS:", EXCEL_LOCAL_PATH)
         return True
     except Exception as e:
-        # Si falla (objeto no existe o credenciales), retornamos False
-        # Esto permite iniciar con un archivo local en /data para testing
-        print("Warning: descarga COS fallida:", e)
+        print("No se pudo descargar desde COS (puede que el objeto no exista aún):", e)
         return False
 
-def upload_to_cos():
-    """
-    Sube el archivo local EXCEL_LOCAL_PATH al COS con nombre EXCEL_OBJECT_NAME.
-    """
+def upload_to_cos() -> bool:
+    """Sube EXCEL_LOCAL_PATH a COS (EXCEL_OBJECT_NAME)."""
     try:
         cos = get_cos_client()
         with open(EXCEL_LOCAL_PATH, "rb") as f:
-            cos.upload_fileobj(f, os.getenv("COS_BUCKET"), EXCEL_OBJECT_NAME)
+            cos.upload_fileobj(f, COS_BUCKET, EXCEL_OBJECT_NAME)
+        print("Subido a COS:", EXCEL_OBJECT_NAME)
         return True
     except Exception as e:
-        print("Warning: subida a COS fallida:", e)
+        print("Error subiendo a COS:", e)
         return False
 
 def read_excel() -> pd.DataFrame:
+    # Si no existe local, intentar descargar
     if not os.path.exists(EXCEL_LOCAL_PATH):
-        # intenta descargar desde COS si no existe local
         download_from_cos()
     if not os.path.exists(EXCEL_LOCAL_PATH):
-        # crear un DataFrame vacío con columnas esperadas
         cols = ["ID","Name","TimeOffBalance","Job","Address","RequestedTimeOff"]
         df = pd.DataFrame(columns=cols)
         df.to_excel(EXCEL_LOCAL_PATH, index=False)
     return pd.read_excel(EXCEL_LOCAL_PATH)
 
 def write_excel(df: pd.DataFrame):
-    # Escritura atómica con lock
     with file_lock:
         tmp = get_temp_path("employees_working.xlsx")
         df.to_excel(tmp, index=False)
         os.replace(tmp, EXCEL_LOCAL_PATH)
-        # subir a COS (intento, si falla no rompe)
+        # intentar subir (si falla, no rompe la app)
         upload_to_cos()
 
-def list_employees():
-    df = read_excel()
-    return df
+def list_employees() -> pd.DataFrame:
+    return read_excel()
 
-def get_employee_by_id(emp_id: int) -> Optional[pd.Series]:
+def get_employee_by_id(emp_id: int) -> Optional[dict]:
     df = read_excel()
     row = df.loc[df['ID'] == emp_id]
     if row.empty:
         return None
-    return row.iloc[0]
+    return row.iloc[0].to_dict()
 
-def add_employee(data: dict):
+def add_employee(data: dict) -> int:
     with file_lock:
         df = read_excel()
-        # Generar ID si no viene
         if "ID" not in data or data.get("ID") is None:
-            # generamos next ID max+1
-            if df.empty:
-                next_id = 1
-            else:
-                next_id = int(df['ID'].max()) + 1
+            next_id = 1 if df.empty else int(df['ID'].max()) + 1
             data["ID"] = next_id
         else:
-            # verificar unicidad
             if int(data["ID"]) in df['ID'].values:
                 raise ValueError("ID ya existe.")
         df = pd.concat([df, pd.DataFrame([data])], ignore_index=True)
         write_excel(df)
         return data["ID"]
 
-def update_employee(emp_id: int, updates: dict):
+def update_employee(emp_id: int, updates: dict) -> bool:
     with file_lock:
         df = read_excel()
         if emp_id not in df['ID'].values:
@@ -120,7 +103,7 @@ def update_employee(emp_id: int, updates: dict):
         write_excel(df)
         return True
 
-def delete_employee(emp_id: int):
+def delete_employee(emp_id: int) -> bool:
     with file_lock:
         df = read_excel()
         if emp_id not in df['ID'].values:
