@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+pandas
+openpyxl
+ibm-cos-sdk          # ibm_boto3 / ibm-cos-sdk (si faltan paquetes en imagen)
+ibm_boto3
+python-multipart
